@@ -1,20 +1,19 @@
 import streamlit as st
 import json
-import os
+import pandas as pd
+import sqlite3
 from langchain_community.utilities import SQLDatabase
 from langchain_community.llms import Ollama
 from langchain_experimental.sql import SQLDatabaseChain
 from langchain_core.prompts import PromptTemplate
 
 # --- Page Configuration ---
-st.set_page_config(page_title="CRIS AI Assistant", page_icon="🚆", layout="centered")
-
+st.set_page_config(page_title="CRIS AI Assistant", page_icon="🚆", layout="centered", initial_sidebar_state="expanded")
 # --- UI Upgrades: Hide Streamlit Menus & Watermarks ---
 hide_st_style = """
             <style>
             #MainMenu {visibility: hidden;}
             footer {visibility: hidden;}
-            header {visibility: hidden;}
             .block-container {
                 padding-top: 2rem;
                 padding-bottom: 0rem;
@@ -22,19 +21,44 @@ hide_st_style = """
             </style>
             """
 st.markdown(hide_st_style, unsafe_allow_html=True)
+st.markdown(hide_st_style, unsafe_allow_html=True)
 
-# --- Sidebar Controls ---
+# --- Sidebar Controls & Admin ---
 with st.sidebar:
     st.title("⚙️ Agent Controls")
-    st.markdown("Use this panel to manage the chat session during presentations.")
+    st.markdown("Use this panel to manage the chat session.")
     
-    # The Clear Chat Button
+    # 1. Clear Chat Button
     if st.button("🧹 Clear Chat History", use_container_width=True):
-        # Reset the memory to just the opening greeting
         st.session_state.messages = [{"role": "assistant", "content": "Hello! I am your CRIS database assistant. Ask me about train routes, distances, and durations."}]
-        st.rerun() # Instantly refreshes the screen
+        st.rerun()
+        
+    st.markdown("---")
+    
+    # 2. Database Admin Uploader
+    st.subheader("📁 Database Admin")
+    st.markdown("Upload new train data (CSV format) directly to the backend.")
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
-# App Header
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+        
+        # Show a quick preview
+        st.write("Data Preview:")
+        st.dataframe(df.head(3)) 
+        
+        # Add confirmation button to prevent accidental clicks
+        if st.button("Confirm & Upload", use_container_width=True):
+            try:
+                # Connect to the SQLite DB and append the CSV data
+                conn = sqlite3.connect('railway.db')
+                df.to_sql('trains', conn, if_exists='append', index=False)
+                conn.close()
+                st.success("✅ Database updated successfully! The AI can now query this new data.")
+            except Exception as e:
+                st.error(f"❌ Error uploading: {e}")
+
+# --- App Header ---
 st.title("🚆 CRIS Database Agent")
 st.markdown("---") 
 
@@ -64,8 +88,9 @@ def secure_clean_input(user_question):
 @st.cache_resource 
 def get_agent():
     db = SQLDatabase.from_uri('sqlite:///railway.db', include_tables=['trains', 'stations'])
-    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    llm = Ollama(base_url=ollama_base_url, model='mistral', temperature=0)
+    
+    # Using localhost because we are running this directly on your machine now
+    llm = Ollama(model='mistral', base_url='http://localhost:11434', temperature=0)    
     
     _DEFAULT_TEMPLATE = """Given an input question, first create a syntactically correct {dialect} query to run, then look at the results of the query and return the answer.
 
@@ -86,10 +111,12 @@ def get_agent():
 
     Question: {input}"""
 
+    # These are now perfectly aligned with the rest of the function:
     PROMPT = PromptTemplate(input_variables=["input", "table_info", "dialect"], template=_DEFAULT_TEMPLATE)
     
     return SQLDatabaseChain.from_llm(llm=llm, db=db, prompt=PROMPT, verbose=True, use_query_checker=False)
 
+# This line stays against the left margin, outside the function:
 agent = get_agent()
 
 # --- 4. Chat Interface Memory ---
