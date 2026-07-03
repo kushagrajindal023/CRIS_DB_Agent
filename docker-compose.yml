@@ -1,0 +1,62 @@
+services:
+  # 1. Streamlit Web Application
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cris-db-agent-web
+    ports:
+      - "8501:8501"
+    environment:
+      # Option A: Connect to the containerized Ollama service (default)
+      - OLLAMA_BASE_URL=http://ollama:11434
+      
+      # Option B: Connect to Ollama running on your host machine
+      # Uncomment the line below and comment the one above to use host's Ollama.
+      # - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    
+    # Ensures host.docker.internal is resolved correctly, even on Linux
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    
+    # Wait for the Ollama service to start up before starting the web application
+    depends_on:
+      ollama:
+        condition: service_started
+
+  # 2. Containerized Ollama Service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cris-db-agent-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  # 3. Helper Service to Pre-pull the Mistral Model
+  # This runs briefly on startup to ensure the required LLM is downloaded into the Ollama container.
+  ollama-model-prepull:
+    image: ollama/ollama:latest
+    container_name: cris-db-agent-prepull
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    # Wait for Ollama service to start, then execute pull command
+    entrypoint: >
+      sh -c "
+      echo 'Waiting for Ollama service to be ready...';
+      until ollama list > /dev/null 2>&1; do
+        sleep 2;
+      done;
+      echo 'Pulling mistral model... (this may take a few minutes depending on your internet speed)';
+      ollama pull mistral;
+      echo 'Mistral model successfully loaded!';
+      "
+    depends_on:
+      - ollama
+
+volumes:
+  ollama_data:
+    name: cris_db_agent_ollama_data
