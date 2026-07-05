@@ -9,6 +9,7 @@ from langchain_core.prompts import PromptTemplate
 
 # --- Page Configuration ---
 st.set_page_config(page_title="CRIS AI Assistant", page_icon="🚆", layout="centered", initial_sidebar_state="expanded")
+
 # --- UI Upgrades: Hide Streamlit Menus & Watermarks ---
 hide_st_style = """
             <style>
@@ -20,7 +21,6 @@ hide_st_style = """
             }
             </style>
             """
-st.markdown(hide_st_style, unsafe_allow_html=True)
 st.markdown(hide_st_style, unsafe_allow_html=True)
 
 # --- Sidebar Controls & Admin ---
@@ -35,28 +35,102 @@ with st.sidebar:
         
     st.markdown("---")
     
-    # 2. Database Admin Uploader
+    # --- 2. Database Admin Uploader ---
     st.subheader("📁 Database Admin")
-    st.markdown("Upload new train data (CSV format) directly to the backend.")
+    st.markdown("Upload new data (CSV format) directly to the backend.")
+    
+    # NEW: Dynamic Table Input
+    target_table = st.text_input("Enter Database Table Name (e.g., trains, employees):", value="trains")
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
         
-        # Show a quick preview
+        # Stamp every row with the file name for tracking
+        file_name = uploaded_file.name
+        df['source_file'] = file_name
+       
         st.write("Data Preview:")
         st.dataframe(df.head(3)) 
         
-        # Add confirmation button to prevent accidental clicks
         if st.button("Confirm & Upload", use_container_width=True):
             try:
-                # Connect to the SQLite DB and append the CSV data
                 conn = sqlite3.connect('railway.db')
-                df.to_sql('trains', conn, if_exists='append', index=False)
+                
+                # --- NEW SECURITY CHECK ---
+                file_exists = False
+                try:
+                    cursor = conn.cursor()
+                    # Ask the database if this exact file name is already inside this exact table
+                    cursor.execute(f"SELECT COUNT(*) FROM {target_table} WHERE source_file = ?", (file_name,))
+                    if cursor.fetchone()[0] > 0:
+                        file_exists = True
+                except sqlite3.OperationalError:
+                    pass # The table hasn't been created yet, which means the file definitely isn't there!
+                
+                # --- UPLOAD LOGIC ---
+                if file_exists:
+                    st.warning(f"⚠️ Stop! The file '{file_name}' has already been uploaded to the '{target_table}' table.")
+                    conn.close()
+                else:
+                    # Dynamically alter whatever table name was typed
+                    try:
+                        conn.execute(f"ALTER TABLE {target_table} ADD COLUMN source_file TEXT")
+                    except sqlite3.OperationalError:
+                        pass 
+                        
+                    # Upload to the dynamically named table
+                    df.to_sql(target_table, conn, if_exists='append', index=False)
+                    conn.close()
+                    st.success(f"✅ Data from '{file_name}' uploaded successfully into '{target_table}'!")
+                    
+            except Exception as e:
+                st.error(f"❌ Error uploading: {e}") 
+                    
+                # NEW: Upload to the dynamically named table
+                df.to_sql(target_table, conn, if_exists='append', index=False)
                 conn.close()
-                st.success("✅ Database updated successfully! The AI can now query this new data.")
+                st.success(f"✅ Data from '{file_name}' uploaded successfully into '{target_table}'!")
             except Exception as e:
                 st.error(f"❌ Error uploading: {e}")
+
+    # --- 3. Data Management (The Undo Button) ---
+    st.markdown("---")
+    st.subheader("🗑️ Manage Uploads")
+    st.markdown("Remove an entire batch of data based on the file name.")
+
+    # NEW: Tell the undo button which table to look at
+    manage_table = st.text_input("Table to manage:", value="trains", key="manage_table_input")
+
+    try:
+        conn = sqlite3.connect('railway.db')
+        cursor = conn.cursor()
+        
+        # NEW: Find files only in the dynamically selected table
+        try:
+            cursor.execute(f"SELECT DISTINCT source_file FROM {manage_table} WHERE source_file IS NOT NULL")
+            files_in_db = [row[0] for row in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            files_in_db = []
+            
+        conn.close()
+        
+        if files_in_db:
+            file_to_delete = st.selectbox("Select a file to remove:", files_in_db)
+            
+            if st.button(f"Delete '{file_to_delete}' Data", type="primary"):
+                conn = sqlite3.connect('railway.db')
+                # NEW: Delete from the dynamically selected table
+                conn.execute(f"DELETE FROM {manage_table} WHERE source_file = ?", (file_to_delete,))
+                conn.commit()
+                conn.close()
+                st.success(f"🗑️ '{file_to_delete}' wiped from '{manage_table}'!")
+                st.rerun() 
+        else:
+            st.info(f"No tracked file uploads found in '{manage_table}'.")
+            
+    except Exception as e:
+        st.error(f"Database error: {e}")
 
 # --- App Header ---
 st.title("🚆 CRIS Database Agent")
@@ -65,8 +139,12 @@ st.markdown("---")
 # --- 1. Load the Dictionary ---
 @st.cache_data 
 def load_station_map():
-    with open('stations.json', 'r') as f:
-        return json.load(f)
+    # Wrap in try/except just in case the JSON file is missing during a cold boot
+    try:
+        with open('stations.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
 
 STATION_LOOKUP = load_station_map()
 
@@ -87,18 +165,19 @@ def secure_clean_input(user_question):
 # --- 3. Initialize the AI Agent ---
 @st.cache_resource 
 def get_agent():
-    db = SQLDatabase.from_uri('sqlite:///railway.db', include_tables=['trains', 'stations'])
+    # NEW: Removed include_tables so LangChain can see any new table you upload [cite: 12]
+    db = SQLDatabase.from_uri('sqlite:///railway.db')
     
-    # Using localhost because we are running this directly on your machine now
     llm = Ollama(model='mistral', base_url='http://localhost:11434', temperature=0)    
     
+    # NEW: Generalized Template for multi-table queries
     _DEFAULT_TEMPLATE = """Given an input question, first create a syntactically correct {dialect} query to run, then look at the results of the query and return the answer.
 
     STRICT SQL RULES:
-    1. If the question asks "Which train", "What train", or asks for identities, your SQLQuery MUST select the train name column.
-    2. To find the highest, longest, or maximum, prefer using 'ORDER BY column DESC LIMIT 1'.
-    3. Always use the LIKE operator with wildcards on the train name column for specific trains (e.g., WHERE name LIKE '%Rajdhani%').
-    4. ONLY use the columns explicitly listed in the schema below. If the user asks for data that does not exist, do not write a SQL query. Instead, return: "I cannot answer this as that specific data is not available."
+    1. Carefully analyze the available tables in {table_info} to determine which table contains the data needed to answer the question.
+    2. ONLY use the columns explicitly listed in the schema for the chosen table. 
+    3. To find the highest, longest, or maximum, prefer using 'ORDER BY column DESC LIMIT 1'.
+    4. If the user asks for data that does not exist in ANY table, do not write a SQL query. Instead, return: "I cannot answer this as that specific data is not available."
 
     Use the following format:
     Question: Question here
@@ -111,12 +190,10 @@ def get_agent():
 
     Question: {input}"""
 
-    # These are now perfectly aligned with the rest of the function:
     PROMPT = PromptTemplate(input_variables=["input", "table_info", "dialect"], template=_DEFAULT_TEMPLATE)
     
     return SQLDatabaseChain.from_llm(llm=llm, db=db, prompt=PROMPT, verbose=True, use_query_checker=False)
 
-# This line stays against the left margin, outside the function:
 agent = get_agent()
 
 # --- 4. Chat Interface Memory ---
@@ -147,7 +224,8 @@ if prompt:
                     result = agent.invoke(cleaned_query)
                     response_text = result["result"]
                 except Exception as e:
-                    response_text = "I encountered a technical error while querying the database."
+                    # This will print the literal python error into your chat UI
+                    response_text = f"I encountered a technical error: {e}"
             
             st.markdown(response_text)
             st.session_state.messages.append({"role": "assistant", "content": response_text})
