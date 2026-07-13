@@ -34,8 +34,9 @@ llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
 db_filename = "railway.db"
 
 # --- 1. BULLETPROOF AUTO-INGESTION (With Nested Data Fix) ---
+# --- 1. BULLETPROOF AUTO-INGESTION ---
 def auto_ingest_json():
-    """Safely initializes DB from JSON files and sanitizes nested data for SQLite."""
+    """Safely initializes DB from JSON files, sanitizes nested data, and unpacks GeoJSON wrappers."""
     if not os.path.exists(db_filename):
         open(db_filename, 'a').close()
 
@@ -61,9 +62,14 @@ def auto_ingest_json():
                     with open(json_file, 'r') as f:
                         data = json.load(f)
                     
-                    # --- THE FIX: Smart parsing based on table and JSON structure ---
-                    if table_name == 'stations' and isinstance(data, dict) and all(not isinstance(v, (list, dict)) for v in data.values()):
-                        # Convert flat mapping dictionary {"City": "Code"} into a 2-column table
+                    # --- THE FIX: Unpack FeatureCollection wrappers ---
+                    if isinstance(data, dict) and 'features' in data and isinstance(data['features'], list):
+                        # This extracts the actual list of trains and flattens nested properties
+                        df = pd.json_normalize(data['features'])
+                        # Clean up GeoJSON column names (e.g., changes 'properties.train_name' to 'train_name')
+                        df.columns = [col.replace('properties.', '') for col in df.columns]
+                        
+                    elif table_name == 'stations' and isinstance(data, dict) and all(not isinstance(v, (list, dict)) for v in data.values()):
                         df = pd.DataFrame(list(data.items()), columns=['station_name', 'station_code'])
                     elif isinstance(data, dict):
                         if all(not isinstance(v, (list, dict)) for v in data.values()):
