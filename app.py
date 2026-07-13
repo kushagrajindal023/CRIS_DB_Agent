@@ -33,26 +33,38 @@ embedder = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
 db_filename = "railway.db"
 
-# --- 1. NEW PART: AUTO-INGESTION ---
-@st.cache_resource
+# --- 1. BULLETPROOF AUTO-INGESTION ---
 def auto_ingest_json():
-    """Initializes DB from JSON if tables are missing."""
+    """Safely initializes DB from JSON files and clears RAG cache if new data is added."""
+    if not os.path.exists(db_filename):
+        open(db_filename, 'a').close()
+
     conn = sqlite3.connect(db_filename)
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trains', 'stations');")
-    tables_found = [row[0] for row in cursor.fetchall()]
+    tables_added = False
     
-    for json_file in ['trains.json', 'stations.json']:
-        table_name = json_file.replace('.json', '')
-        if table_name not in tables_found and os.path.exists(json_file):
-            with open(json_file, 'r') as f:
-                data = json.load(f)
-                # FIX: If data is a dict, wrap it in a list so it creates one row
-                if isinstance(data, dict):
-                    data = [data]
-                pd.DataFrame(data).to_sql(table_name, conn, if_exists='replace', index=False)
+    for table_name in ['trains', 'stations']:
+        json_file = f"{table_name}.json"
+        
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table_name,))
+        if not cursor.fetchone():
+            if os.path.exists(json_file):
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            data = [data]
+                        
+                        df = pd.DataFrame(data)
+                        df.to_sql(table_name, conn, if_exists='replace', index=False)
+                        tables_added = True
+                except Exception as e:
+                    st.sidebar.error(f"Failed to load {json_file}: {e}")
     conn.close()
-# Run the ingestion immediately on start
+    
+    if tables_added:
+        st.cache_resource.clear()
+
 auto_ingest_json()
 
 # --- 2. Load the Dictionary ---
@@ -60,8 +72,11 @@ auto_ingest_json()
 def load_station_map():
     try:
         with open('stations.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
+            data = json.load(f)
+            if isinstance(data, list):
+                return {} 
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 STATION_LOOKUP = load_station_map()
@@ -83,13 +98,19 @@ def initialize_database_knowledge():
         
     conn = sqlite3.connect(db_filename)
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = [row[0] for row in cursor.fetchall() if not row[0].startswith("sqlite_")]
     
-    if not tables:
+    try:
+        cursor.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        if cursor.fetchone()[0] == 0:
+            conn.close()
+            return None
+    except:
         conn.close()
         return None
         
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+    tables = [row[0] for row in cursor.fetchall()]
+    
     schema_descriptions = []
     for table_name in tables:
         cursor.execute(f"PRAGMA table_info({table_name});")
@@ -115,20 +136,42 @@ with st.sidebar:
 
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
-        df['source_file'] = uploaded_file.name
+        file_name = uploaded_file.name
+        df['source_file'] = file_name
         st.dataframe(df.head(3)) 
         
         if st.button("Confirm & Upload", use_container_width=True):
             conn = sqlite3.connect(db_filename)
-            df.to_sql(target_table, conn, if_exists='append', index=False)
-            conn.close()
-            st.cache_resource.clear()
-            st.success("Uploaded!")
-            st.rerun()
+            
+            # Duplicate Firewall
+            file_exists = False
+            try:
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM {target_table} WHERE source_file = ?", (file_name,))
+                if cursor.fetchone()[0] > 0:
+                    file_exists = True
+            except sqlite3.OperationalError:
+                pass 
+                
+            if file_exists:
+                st.warning(f"⚠️ Stop! The file '{file_name}' has already been uploaded to '{target_table}'.")
+                conn.close()
+            else:
+                try:
+                    conn.execute(f"ALTER TABLE {target_table} ADD COLUMN source_file TEXT")
+                except sqlite3.OperationalError:
+                    pass 
+                    
+                df.to_sql(target_table, conn, if_exists='append', index=False)
+                conn.close()
+                
+                st.cache_resource.clear()
+                st.success(f"✅ Data from '{file_name}' uploaded successfully!")
+                st.rerun()
 
     st.markdown("---")
     st.subheader("🗑️ Manage Uploads")
-    manage_table = st.text_input("Table to manage:", value="trains")
+    manage_table = st.text_input("Table to manage:", value="trains", key="manage")
 
     conn = sqlite3.connect(db_filename)
     try:
@@ -138,12 +181,23 @@ with st.sidebar:
             file_to_del = st.selectbox("Select file to remove:", files_in_db)
             if st.button("Delete Data"):
                 conn.execute(f"DELETE FROM {manage_table} WHERE source_file = ?", (file_to_del,))
+                
+                # Auto-Drop Empty Table
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM {manage_table}")
+                if cursor.fetchone()[0] == 0:
+                    conn.execute(f"DROP TABLE {manage_table}")
+                    
                 conn.commit()
                 st.cache_resource.clear()
+                st.success(f"🗑️ '{file_to_del}' wiped from '{manage_table}'!")
                 st.rerun()
-        else: st.info("No tracked files found.")
-    except: st.info("No tracked files found.")
-    conn.close()
+        else: 
+            st.info("No tracked files found.")
+    except Exception: 
+        st.info("No tracked files found.")
+    finally:
+        conn.close()
 
 # --- 6. App Header & Chat ---
 st.title("🚆 CRIS Database Agent")
@@ -155,7 +209,6 @@ if "messages" not in st.session_state:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]): st.markdown(msg["content"])
 
-# Main Chat Input (No longer disabled)
 prompt = st.chat_input("Message CRIS Agent...")
 
 if prompt:
@@ -173,6 +226,8 @@ if prompt:
                     df = pd.read_sql_query(sql, conn)
                     conn.close()
                     st.dataframe(df)
-                    st.session_state.messages.append({"role": "assistant", "content": f"Query: {sql}"})
-                except Exception as e: st.error(f"Error: {e}")
-        else: st.warning("Database not initialized.")
+                    st.session_state.messages.append({"role": "assistant", "content": f"Query executed successfully."})
+                except Exception as e: 
+                    st.error(f"SQL Error: {e}")
+        else: 
+            st.warning("Database not initialized. Please check your data files.")
