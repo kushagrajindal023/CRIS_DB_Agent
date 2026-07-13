@@ -33,10 +33,9 @@ embedder = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
 db_filename = "railway.db"
 
-# --- 1. BULLETPROOF AUTO-INGESTION (With Nested Data Fix) ---
 # --- 1. BULLETPROOF AUTO-INGESTION ---
 def auto_ingest_json():
-    """Safely initializes DB from JSON files, sanitizes nested data, and unpacks GeoJSON wrappers."""
+    """Safely initializes DB from JSON files, sanitizes nested data, and cleanly unpacks GeoJSON properties."""
     if not os.path.exists(db_filename):
         open(db_filename, 'a').close()
 
@@ -62,12 +61,11 @@ def auto_ingest_json():
                     with open(json_file, 'r') as f:
                         data = json.load(f)
                     
-                    # --- THE FIX: Unpack FeatureCollection wrappers ---
+                    # --- THE FIX: Cleanly extract ONLY the properties to avoid column collisions ---
                     if isinstance(data, dict) and 'features' in data and isinstance(data['features'], list):
-                        # This extracts the actual list of trains and flattens nested properties
-                        df = pd.json_normalize(data['features'])
-                        # Clean up GeoJSON column names (e.g., changes 'properties.train_name' to 'train_name')
-                        df.columns = [col.replace('properties.', '') for col in df.columns]
+                        # Safely pull only the 'properties' dictionary from each feature
+                        properties_list = [feature.get('properties', {}) for feature in data['features']]
+                        df = pd.DataFrame(properties_list)
                         
                     elif table_name == 'stations' and isinstance(data, dict) and all(not isinstance(v, (list, dict)) for v in data.values()):
                         df = pd.DataFrame(list(data.items()), columns=['station_name', 'station_code'])
