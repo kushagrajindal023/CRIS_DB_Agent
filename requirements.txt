@@ -1,6 +1,24 @@
+# -------------------------------------------------------
+# Railway Database RAG Agent — Python Dependencies
+# -------------------------------------------------------
+# Install with: pip install -r requirements.txt
+
+# --- Web UI ---
+streamlit
+
+# --- LangChain Core & Integrations ---
 langchain
 langchain-community
-langchain-experimental
-sqlalchemy
-streamlit
+langchain-groq
+langchain-google-genai
+
+# --- Vector Store ---
+chromadb
+
+# --- Database & Data Handling ---
 pandas
+sqlalchemy
+
+# --- SQLite compatibility fix for ChromaDB (if needed) ---
+# Uncomment the line below if you hit a "sqlite3 version" error on Linux/older systems.
+# pysqlite3-binary

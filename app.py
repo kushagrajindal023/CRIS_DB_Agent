@@ -1,11 +1,13 @@
-import streamlit as st
+import os
 import json
 import pandas as pd
 import sqlite3
-from langchain_community.utilities import SQLDatabase
-from langchain_community.llms import Ollama
-from langchain_experimental.sql import SQLDatabaseChain
-from langchain_core.prompts import PromptTemplate
+import streamlit as st
+
+# --- NEW RAG IMPORTS ---
+from langchain_groq import ChatGroq
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
 
 # --- Page Configuration ---
 st.set_page_config(page_title="CRIS AI Assistant", page_icon="🚆", layout="centered", initial_sidebar_state="expanded")
@@ -23,6 +25,68 @@ hide_st_style = """
             """
 st.markdown(hide_st_style, unsafe_allow_html=True)
 
+# --- SECURITY & KEYS CONFIGURATION ---
+# Using the secrets.toml file we discussed
+os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+
+embedder = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
+db_filename = "railway.db"
+
+# --- 1. Load the Dictionary ---
+@st.cache_data 
+def load_station_map():
+    try:
+        with open('stations.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+STATION_LOOKUP = load_station_map()
+
+# --- 2. Clean Input ---
+def secure_clean_input(user_question):
+    lowered_question = user_question.lower()
+    for city_name, station_code in STATION_LOOKUP.items():
+        if city_name in lowered_question:
+            lowered_question = lowered_question.replace(city_name, station_code)
+    return lowered_question
+
+# --- 3. RAG STEP 1: AUTOMATED LIVE SCHEMA INGESTION ---
+@st.cache_resource
+def initialize_database_knowledge():
+    """Calculates the embedded vectors of the database schemas."""
+    if not os.path.exists(db_filename):
+        return None
+        
+    conn = sqlite3.connect(db_filename)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [row[0] for row in cursor.fetchall()]
+    
+    if not tables:
+        conn.close()
+        return None
+        
+    live_metadata = {}
+    for table_name in tables:
+        if table_name.startswith("sqlite_"): continue
+        cursor.execute(f"PRAGMA table_info({table_name});")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        auto_prompt = f"Write a concise sentence describing a table named '{table_name}' with columns: {', '.join(columns)}. Return ONLY the sentence."
+        ai_description = llm.invoke(auto_prompt).content.strip()
+        live_metadata[table_name] = {"columns": columns, "description": ai_description}
+    conn.close()
+    
+    schema_descriptions = []
+    for table, info in live_metadata.items():
+        schema_descriptions.append(f"Table: {table}. Columns: {', '.join(info['columns'])}. Description: {info['description']}")
+        
+    vector_store = Chroma.from_texts(texts=schema_descriptions, embedding=embedder)
+    return vector_store
+
 # --- Sidebar Controls & Admin ---
 with st.sidebar:
     st.title("⚙️ Agent Controls")
@@ -30,7 +94,7 @@ with st.sidebar:
     
     # 1. Clear Chat Button
     if st.button("🧹 Clear Chat History", use_container_width=True):
-        st.session_state.messages = [{"role": "assistant", "content": "Hello! I am your CRIS database assistant. Ask me about train routes, distances, and durations."}]
+        st.session_state.messages = [{"role": "assistant", "content": "Hello! I am your CRIS database assistant. Ask me about your uploaded data."}]
         st.rerun()
         
     st.markdown("---")
@@ -39,14 +103,11 @@ with st.sidebar:
     st.subheader("📁 Database Admin")
     st.markdown("Upload new data (CSV format) directly to the backend.")
     
-    # NEW: Dynamic Table Input
     target_table = st.text_input("Enter Database Table Name (e.g., trains, employees):", value="trains")
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
-        
-        # Stamp every row with the file name for tracking
         file_name = uploaded_file.name
         df['source_file'] = file_name
        
@@ -55,76 +116,71 @@ with st.sidebar:
         
         if st.button("Confirm & Upload", use_container_width=True):
             try:
-                conn = sqlite3.connect('railway.db')
+                conn = sqlite3.connect(db_filename)
                 
-                # --- NEW SECURITY CHECK ---
+                # SECURITY CHECK: Duplicate Firewall
                 file_exists = False
                 try:
                     cursor = conn.cursor()
-                    # Ask the database if this exact file name is already inside this exact table
                     cursor.execute(f"SELECT COUNT(*) FROM {target_table} WHERE source_file = ?", (file_name,))
                     if cursor.fetchone()[0] > 0:
                         file_exists = True
                 except sqlite3.OperationalError:
-                    pass # The table hasn't been created yet, which means the file definitely isn't there!
-                
-                # --- UPLOAD LOGIC ---
+                    pass 
+
                 if file_exists:
                     st.warning(f"⚠️ Stop! The file '{file_name}' has already been uploaded to the '{target_table}' table.")
                     conn.close()
                 else:
-                    # Dynamically alter whatever table name was typed
                     try:
                         conn.execute(f"ALTER TABLE {target_table} ADD COLUMN source_file TEXT")
                     except sqlite3.OperationalError:
                         pass 
                         
-                    # Upload to the dynamically named table
                     df.to_sql(target_table, conn, if_exists='append', index=False)
                     conn.close()
                     st.success(f"✅ Data from '{file_name}' uploaded successfully into '{target_table}'!")
                     
+                    # 🔴 RAG TRIGGER: Clear cache to calculate embedded vectors of the new file automatically!
+                    st.cache_resource.clear()
             except Exception as e:
                 st.error(f"❌ Error uploading: {e}") 
-                    
-                # NEW: Upload to the dynamically named table
-                df.to_sql(target_table, conn, if_exists='append', index=False)
-                conn.close()
-                st.success(f"✅ Data from '{file_name}' uploaded successfully into '{target_table}'!")
-            except Exception as e:
-                st.error(f"❌ Error uploading: {e}")
 
     # --- 3. Data Management (The Undo Button) ---
     st.markdown("---")
     st.subheader("🗑️ Manage Uploads")
     st.markdown("Remove an entire batch of data based on the file name.")
 
-    # NEW: Tell the undo button which table to look at
     manage_table = st.text_input("Table to manage:", value="trains", key="manage_table_input")
 
     try:
-        conn = sqlite3.connect('railway.db')
+        conn = sqlite3.connect(db_filename)
         cursor = conn.cursor()
-        
-        # NEW: Find files only in the dynamically selected table
         try:
             cursor.execute(f"SELECT DISTINCT source_file FROM {manage_table} WHERE source_file IS NOT NULL")
             files_in_db = [row[0] for row in cursor.fetchall()]
         except sqlite3.OperationalError:
             files_in_db = []
-            
         conn.close()
         
         if files_in_db:
             file_to_delete = st.selectbox("Select a file to remove:", files_in_db)
             
             if st.button(f"Delete '{file_to_delete}' Data", type="primary"):
-                conn = sqlite3.connect('railway.db')
-                # NEW: Delete from the dynamically selected table
+                conn = sqlite3.connect(db_filename)
                 conn.execute(f"DELETE FROM {manage_table} WHERE source_file = ?", (file_to_delete,))
+                
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM {manage_table}")
+                if cursor.fetchone()[0] == 0:
+                    conn.execute(f"DROP TABLE {manage_table}")
+                    
                 conn.commit()
                 conn.close()
                 st.success(f"🗑️ '{file_to_delete}' wiped from '{manage_table}'!")
+                
+                # 🔴 RAG TRIGGER: Clear cache to update embedded vectors after deletion!
+                st.cache_resource.clear()
                 st.rerun() 
         else:
             st.info(f"No tracked file uploads found in '{manage_table}'.")
@@ -136,96 +192,80 @@ with st.sidebar:
 st.title("🚆 CRIS Database Agent")
 st.markdown("---") 
 
-# --- 1. Load the Dictionary ---
-@st.cache_data 
-def load_station_map():
-    # Wrap in try/except just in case the JSON file is missing during a cold boot
-    try:
-        with open('stations.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-STATION_LOOKUP = load_station_map()
-
-# --- 2. The Safety Firewall ---
-def secure_clean_input(user_question):
-    lowered_question = user_question.lower()
-    
-    forbidden_words = ["platform", "ticket price", "live status", "fare", "pantry"]
-    if any(word in lowered_question for word in forbidden_words):
-        return "BLOCKED"
-        
-    for city_name, station_code in STATION_LOOKUP.items():
-        if city_name in lowered_question:
-            lowered_question = lowered_question.replace(city_name, station_code)
-            
-    return lowered_question
-
-# --- 3. Initialize the AI Agent ---
-@st.cache_resource 
-def get_agent():
-    # NEW: Removed include_tables so LangChain can see any new table you upload [cite: 12]
-    db = SQLDatabase.from_uri('sqlite:///railway.db')
-    
-    llm = Ollama(model='mistral', base_url='http://localhost:11434', temperature=0)    
-    
-    # NEW: Generalized Template for multi-table queries
-    _DEFAULT_TEMPLATE = """Given an input question, first create a syntactically correct {dialect} query to run, then look at the results of the query and return the answer.
-
-    STRICT SQL RULES:
-    1. Carefully analyze the available tables in {table_info} to determine which table contains the data needed to answer the question.
-    2. ONLY use the columns explicitly listed in the schema for the chosen table. 
-    3. To find the highest, longest, or maximum, prefer using 'ORDER BY column DESC LIMIT 1'.
-    4. If the user asks for data that does not exist in ANY table, do not write a SQL query. Instead, return: "I cannot answer this as that specific data is not available."
-
-    Use the following format:
-    Question: Question here
-    SQLQuery: SQL Query to run
-    SQLResult: Result of the SQLQuery
-    Answer: Final answer here
-
-    Only use the following tables:
-    {table_info}
-
-    Question: {input}"""
-
-    PROMPT = PromptTemplate(input_variables=["input", "table_info", "dialect"], template=_DEFAULT_TEMPLATE)
-    
-    return SQLDatabaseChain.from_llm(llm=llm, db=db, prompt=PROMPT, verbose=True, use_query_checker=False)
-
-agent = get_agent()
+# Load the vector store automatically on launch
+vector_store = None
+if os.path.exists(db_filename):
+    with st.spinner("🔄 Initializing AI and calculating embedded vectors..."):
+        vector_store = initialize_database_knowledge()
+else:
+    st.info("👈 Please use the Database Admin panel to upload your first CSV file.")
 
 # --- 4. Chat Interface Memory ---
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Hello! I am your CRIS database assistant. Ask me about train routes, distances, and durations."}]
+    st.session_state.messages = [{"role": "assistant", "type": "text", "content": "Hello! I am your CRIS database assistant. Ask me about your uploaded data."}]
 
 for message in st.session_state.messages:
     avatar = "🧑‍💻" if message["role"] == "user" else "🚆"
     with st.chat_message(message["role"], avatar=avatar):
-        st.markdown(message["content"])
+        if message["type"] == "text":
+            st.markdown(message["content"])
+        elif message["type"] == "dataframe":
+            st.dataframe(message["content"], use_container_width=True)
 
-# --- 5. The Main Chat Loop ---
-prompt = st.chat_input("Message CRIS Agent...")
+# --- 5. The Main Chat Loop (RAG Execution) ---
+prompt = st.chat_input("Message CRIS Agent...", disabled=(vector_store is None))
 if prompt:
     
+    st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
     st.chat_message("user", avatar="🧑‍💻").markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant", avatar="🚆"):
-        with st.spinner("Searching database..."):
-            
+        with st.status("Searching database...") as status:
             cleaned_query = secure_clean_input(prompt)
             
-            if cleaned_query == "BLOCKED":
-                response_text = "I cannot answer this as that specific data (like platforms or prices) is not available in the database."
+            try:
+                # STEP A: RAG RETRIEVAL 
+                status.update(label="🕵️ Finding correct table schema...")
+                best_matches = vector_store.similarity_search(cleaned_query, k=1)
+                retrieved_table_info = best_matches[0].page_content
+                
+                # STEP B: RAG GENERATION (Writing the SQL)
+                status.update(label="🧠 Writing specific SQL query...")
+                dynamic_prompt = f"""
+                You are a precise data analyst. 
+                Translate this question into a SQLite query: "{cleaned_query}"
+                
+                Use ONLY this database schema context:
+                {retrieved_table_info}
+                
+                Instructions:
+                1. Write standard SQL. Do NOT select the 'source_file' tracking column.
+                2. Return ONLY the raw, executable SQL query string. 
+                3. Do not include markdown formatting or conversational text.
+                """
+                generated_sql = llm.invoke(dynamic_prompt).content.strip()
+                generated_sql = generated_sql.replace("```sql", "").replace("```", "").strip()
+                
+                # STEP C: RAG EXECUTION (Pandas Dataframe)
+                status.update(label="⚡ Fetching data from SQLite...")
+                conn = sqlite3.connect(db_filename)
+                result_df = pd.read_sql_query(generated_sql, conn)
+                conn.close()
+                
+                status.update(label="✅ Data retrieved successfully!", state="complete")
+                
+            except Exception as e:
+                status.update(label="❌ Encountered an error", state="error")
+                st.error(f"Technical error: {e}")
+                result_df = None
+
+        # Display final results to the user
+        if result_df is not None:
+            if result_df.empty:
+                empty_msg = "The query ran successfully, but no matching records were found."
+                st.markdown(empty_msg)
+                st.session_state.messages.append({"role": "assistant", "type": "text", "content": empty_msg})
             else:
-                try:
-                    result = agent.invoke(cleaned_query)
-                    response_text = result["result"]
-                except Exception as e:
-                    # This will print the literal python error into your chat UI
-                    response_text = f"I encountered a technical error: {e}"
-            
-            st.markdown(response_text)
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
+                st.dataframe(result_df, use_container_width=True)
+                # Save the table to chat history so it doesn't disappear
+                st.session_state.messages.append({"role": "assistant", "type": "dataframe", "content": result_df})
