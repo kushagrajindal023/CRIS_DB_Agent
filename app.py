@@ -254,15 +254,26 @@ if prompt:
     with st.chat_message("assistant"):
         if vector_store:
             with st.status("Querying..."):
-                cleaned = secure_clean_input(prompt)
-                match = vector_store.similarity_search(cleaned, k=1)[0].page_content
-                sql = llm.invoke(f"Write SQL for: {cleaned} using: {match}. Return ONLY SQL.").content.replace("```sql", "").replace("```", "").strip()
+                # 1. Skip the text lowercasing, pass the raw prompt to preserve intent
+                match = vector_store.similarity_search(prompt, k=1)[0].page_content
+                
+                # 2. Instruct the LLM to use LIKE for case-insensitive matching
+                ai_instructions = f"Write SQL for: '{prompt}' using this schema: {match}. IMPORTANT: Always use the 'LIKE' operator with '%' wildcards instead of '=' for text filtering to handle case insensitivity. Return ONLY valid SQL code."
+                
+                sql = llm.invoke(ai_instructions).content.replace("```sql", "").replace("```", "").strip()
+                
                 try:
                     conn = sqlite3.connect(db_filename)
                     df = pd.read_sql_query(sql, conn)
                     conn.close()
+                    
                     st.dataframe(df)
-                    st.session_state.messages.append({"role": "assistant", "content": f"Query executed successfully."})
+                    
+                    # 3. Add a debug expander so you can inspect the generated SQL!
+                    with st.expander("🔍 See Generated SQL"):
+                        st.code(sql, language="sql")
+                        
+                    st.session_state.messages.append({"role": "assistant", "content": f"Here is the data you requested!"})
                 except Exception as e: 
                     st.error(f"SQL Error: {e}")
         else: 
