@@ -46,18 +46,36 @@ def auto_ingest_json():
     for table_name in ['trains', 'stations']:
         json_file = f"{table_name}.json"
         
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table_name,))
-        if not cursor.fetchone():
+        # Check if table exists AND has rows
+        table_exists = False
+        try:
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name};")
+            if cursor.fetchone()[0] > 0:
+                table_exists = True
+        except sqlite3.OperationalError:
+            pass # Table doesn't exist yet
+            
+        if not table_exists:
             if os.path.exists(json_file):
                 try:
                     with open(json_file, 'r') as f:
                         data = json.load(f)
-                        if isinstance(data, dict):
-                            data = [data]
-                        
+                    
+                    # Smart parsing based on JSON type
+                    if isinstance(data, dict):
+                        # Check if it's a dictionary of scalar values (single record)
+                        if all(not isinstance(v, (list, dict)) for v in data.values()):
+                            df = pd.DataFrame([data])
+                        else:
+                            # It's a dictionary of lists/objects (column-oriented or index-oriented)
+                            df = pd.DataFrame.from_dict(data)
+                    else:
+                        # It's a list of records
                         df = pd.DataFrame(data)
-                        df.to_sql(table_name, conn, if_exists='replace', index=False)
-                        tables_added = True
+                        
+                    # Drop the table if it exists but was empty/corrupted, then write clean data
+                    df.to_sql(table_name, conn, if_exists='replace', index=False)
+                    tables_added = True
                 except Exception as e:
                     st.sidebar.error(f"Failed to load {json_file}: {e}")
     conn.close()
@@ -123,6 +141,19 @@ def initialize_database_knowledge():
 # --- 5. Sidebar Controls & Admin ---
 with st.sidebar:
     st.title("⚙️ Agent Controls")
+    
+    # --- NEW LIVE DB STATS ---
+    st.subheader("📊 Live Database Stats")
+    try:
+        monitor_conn = sqlite3.connect(db_filename)
+        t_count = pd.read_sql("SELECT COUNT(*) as c FROM trains", monitor_conn)['c'].iloc[0]
+        s_count = pd.read_sql("SELECT COUNT(*) as c FROM stations", monitor_conn)['c'].iloc[0]
+        monitor_conn.close()
+        st.write(f"🔹 **Trains Table:** {t_count} rows loaded")
+        st.write(f"🔹 **Stations Table:** {s_count} rows loaded")
+    except Exception:
+        st.write("❌ Tables not fully created yet.")
+    st.markdown("---")
     
     if st.button("🧹 Clear Chat History", use_container_width=True):
         st.session_state.messages = [{"role": "assistant", "content": "Hello! I am your CRIS database assistant."}]
