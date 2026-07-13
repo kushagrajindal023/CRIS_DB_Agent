@@ -33,9 +33,9 @@ embedder = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
 db_filename = "railway.db"
 
-# --- 1. BULLETPROOF AUTO-INGESTION ---
+# --- 1. BULLETPROOF AUTO-INGESTION (With Nested Data Fix) ---
 def auto_ingest_json():
-    """Safely initializes DB from JSON files and clears RAG cache if new data is added."""
+    """Safely initializes DB from JSON files and sanitizes nested data for SQLite."""
     if not os.path.exists(db_filename):
         open(db_filename, 'a').close()
 
@@ -61,19 +61,22 @@ def auto_ingest_json():
                     with open(json_file, 'r') as f:
                         data = json.load(f)
                     
-                    # Smart parsing based on JSON type
+                    # Smart parsing based on JSON structure
                     if isinstance(data, dict):
-                        # Check if it's a dictionary of scalar values (single record)
                         if all(not isinstance(v, (list, dict)) for v in data.values()):
                             df = pd.DataFrame([data])
                         else:
-                            # It's a dictionary of lists/objects (column-oriented or index-oriented)
                             df = pd.DataFrame.from_dict(data)
                     else:
-                        # It's a list of records
                         df = pd.DataFrame(data)
                         
-                    # Drop the table if it exists but was empty/corrupted, then write clean data
+                    # SANITIZE: Convert any nested Python lists/dicts into JSON strings so SQLite accepts them
+                    for col in df.columns:
+                        df[col] = df[col].apply(
+                            lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x
+                        )
+                        
+                    # Write clean data to database
                     df.to_sql(table_name, conn, if_exists='replace', index=False)
                     tables_added = True
                 except Exception as e:
@@ -142,7 +145,7 @@ def initialize_database_knowledge():
 with st.sidebar:
     st.title("⚙️ Agent Controls")
     
-    # --- NEW LIVE DB STATS ---
+    # --- LIVE DB STATS ---
     st.subheader("📊 Live Database Stats")
     try:
         monitor_conn = sqlite3.connect(db_filename)
