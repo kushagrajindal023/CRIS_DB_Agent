@@ -53,7 +53,7 @@ def auto_ingest_json():
             if cursor.fetchone()[0] > 0:
                 table_exists = True
         except sqlite3.OperationalError:
-            pass # Table doesn't exist yet
+            pass 
             
         if not table_exists:
             if os.path.exists(json_file):
@@ -61,8 +61,11 @@ def auto_ingest_json():
                     with open(json_file, 'r') as f:
                         data = json.load(f)
                     
-                    # Smart parsing based on JSON structure
-                    if isinstance(data, dict):
+                    # --- THE FIX: Smart parsing based on table and JSON structure ---
+                    if table_name == 'stations' and isinstance(data, dict) and all(not isinstance(v, (list, dict)) for v in data.values()):
+                        # Convert flat mapping dictionary {"City": "Code"} into a 2-column table
+                        df = pd.DataFrame(list(data.items()), columns=['station_name', 'station_code'])
+                    elif isinstance(data, dict):
                         if all(not isinstance(v, (list, dict)) for v in data.values()):
                             df = pd.DataFrame([data])
                         else:
@@ -70,7 +73,7 @@ def auto_ingest_json():
                     else:
                         df = pd.DataFrame(data)
                         
-                    # SANITIZE: Convert any nested Python lists/dicts into JSON strings so SQLite accepts them
+                    # SANITIZE: Convert any nested Python lists/dicts into JSON strings
                     for col in df.columns:
                         df[col] = df[col].apply(
                             lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x
@@ -85,7 +88,6 @@ def auto_ingest_json():
     
     if tables_added:
         st.cache_resource.clear()
-
 auto_ingest_json()
 
 # --- 2. Load the Dictionary ---
