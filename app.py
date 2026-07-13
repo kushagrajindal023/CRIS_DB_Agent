@@ -39,18 +39,19 @@ def auto_ingest_json():
     """Initializes DB from JSON if tables are missing."""
     conn = sqlite3.connect(db_filename)
     cursor = conn.cursor()
-    # Check if tables 'trains' or 'stations' already exist in the database
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trains', 'stations');")
     tables_found = [row[0] for row in cursor.fetchall()]
     
-    # Only ingest if the table is not already found
     for json_file in ['trains.json', 'stations.json']:
         table_name = json_file.replace('.json', '')
         if table_name not in tables_found and os.path.exists(json_file):
             with open(json_file, 'r') as f:
-                pd.DataFrame(json.load(f)).to_sql(table_name, conn, if_exists='replace', index=False)
+                data = json.load(f)
+                # FIX: If data is a dict, wrap it in a list so it creates one row
+                if isinstance(data, dict):
+                    data = [data]
+                pd.DataFrame(data).to_sql(table_name, conn, if_exists='replace', index=False)
     conn.close()
-
 # Run the ingestion immediately on start
 auto_ingest_json()
 
